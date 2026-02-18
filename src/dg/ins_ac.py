@@ -26,40 +26,44 @@ Chorin (1967), JCP 2, pp. 12-26.
 """
 
 import numpy as np
-from numba import njit
+from numba import njit, prange
 
 
 # =============================================================================
 # Physical fluxes
 # =============================================================================
 
-def ac_flux_x(q: np.ndarray, beta: float = 1.0) -> np.ndarray:
-    """
-    x-direction convective flux F(q).
-
-    q: (K, Np, 3) with q[:,:,0]=u, q[:,:,1]=v, q[:,:,2]=p
-    """
-    u = q[:, :, 0]
-    v = q[:, :, 1]
-    p = q[:, :, 2]
-    Fx = np.empty_like(q)
-    Fx[:, :, 0] = u * u + p
-    Fx[:, :, 1] = u * v
-    Fx[:, :, 2] = beta**2 * u
+@njit(cache=True, parallel=True)
+def ac_flux_x(q, beta=1.0):
+    """x-direction convective flux F(q). q: (K, Np, 3)."""
+    K, Np, _ = q.shape
+    Fx = np.empty((K, Np, 3), dtype=np.float64)
+    b2 = beta * beta
+    for k in prange(K):
+        for i in range(Np):
+            u = q[k, i, 0]
+            v = q[k, i, 1]
+            p = q[k, i, 2]
+            Fx[k, i, 0] = u * u + p
+            Fx[k, i, 1] = u * v
+            Fx[k, i, 2] = b2 * u
     return Fx
 
 
-def ac_flux_y(q: np.ndarray, beta: float = 1.0) -> np.ndarray:
-    """
-    y-direction convective flux G(q).
-    """
-    u = q[:, :, 0]
-    v = q[:, :, 1]
-    p = q[:, :, 2]
-    Fy = np.empty_like(q)
-    Fy[:, :, 0] = u * v
-    Fy[:, :, 1] = v * v + p
-    Fy[:, :, 2] = beta**2 * v
+@njit(cache=True, parallel=True)
+def ac_flux_y(q, beta=1.0):
+    """y-direction convective flux G(q). q: (K, Np, 3)."""
+    K, Np, _ = q.shape
+    Fy = np.empty((K, Np, 3), dtype=np.float64)
+    b2 = beta * beta
+    for k in prange(K):
+        for i in range(Np):
+            u = q[k, i, 0]
+            v = q[k, i, 1]
+            p = q[k, i, 2]
+            Fy[k, i, 0] = u * v
+            Fy[k, i, 1] = v * v + p
+            Fy[k, i, 2] = b2 * v
     return Fy
 
 
@@ -67,51 +71,49 @@ def ac_flux_y(q: np.ndarray, beta: float = 1.0) -> np.ndarray:
 # Numerical flux (Rusanov)
 # =============================================================================
 
-def ac_numerical_flux(q_int: np.ndarray, q_ext: np.ndarray,
-                      nx: np.ndarray, ny: np.ndarray,
-                      beta: float = 1.0) -> np.ndarray:
+@njit(cache=True, parallel=True)
+def ac_numerical_flux(q_int, q_ext, nx, ny, beta=1.0):
     """
     Rusanov numerical flux for the AC system.
 
     F̂·n = ½[(F_int + F_ext)·n] - ½λ_max(q_ext - q_int)
 
-    λ_max = max(|V·n| + √((V·n)² + β²)) over int/ext states
-    where V = (u, v) is the velocity.
+    λ_max = max(|V·n| + √((V·n)² + β²)) over int/ext states.
     """
     K, n_fp, nv = q_int.shape
+    b2 = beta * beta
+    f_num = np.empty((K, n_fp, nv), dtype=np.float64)
 
-    u_int = q_int[:, :, 0]
-    v_int = q_int[:, :, 1]
-    p_int = q_int[:, :, 2]
-    u_ext = q_ext[:, :, 0]
-    v_ext = q_ext[:, :, 1]
-    p_ext = q_ext[:, :, 2]
+    for k in prange(K):
+        for i in range(n_fp):
+            ui = q_int[k, i, 0]
+            vi = q_int[k, i, 1]
+            pi = q_int[k, i, 2]
+            ue = q_ext[k, i, 0]
+            ve = q_ext[k, i, 1]
+            pe = q_ext[k, i, 2]
+            nx_ki = nx[k, i]
+            ny_ki = ny[k, i]
 
-    # Normal velocity
-    Vn_int = u_int * nx + v_int * ny
-    Vn_ext = u_ext * nx + v_ext * ny
+            Vn_i = ui * nx_ki + vi * ny_ki
+            Vn_e = ue * nx_ki + ve * ny_ki
 
-    # Max wavespeed
-    lam_int = np.abs(Vn_int) + np.sqrt(Vn_int**2 + beta**2)
-    lam_ext = np.abs(Vn_ext) + np.sqrt(Vn_ext**2 + beta**2)
-    lam_max = np.maximum(lam_int, lam_ext)
+            lam_i = abs(Vn_i) + np.sqrt(Vn_i * Vn_i + b2)
+            lam_e = abs(Vn_e) + np.sqrt(Vn_e * Vn_e + b2)
+            lam = max(lam_i, lam_e)
 
-    # Physical flux · n for interior
-    fn_int = np.empty((K, n_fp, nv))
-    fn_int[:, :, 0] = (u_int**2 + p_int) * nx + (u_int * v_int) * ny
-    fn_int[:, :, 1] = (u_int * v_int) * nx + (v_int**2 + p_int) * ny
-    fn_int[:, :, 2] = beta**2 * (u_int * nx + v_int * ny)
+            # F·n interior
+            fni0 = (ui * ui + pi) * nx_ki + (ui * vi) * ny_ki
+            fni1 = (ui * vi) * nx_ki + (vi * vi + pi) * ny_ki
+            fni2 = b2 * (ui * nx_ki + vi * ny_ki)
+            # F·n exterior
+            fne0 = (ue * ue + pe) * nx_ki + (ue * ve) * ny_ki
+            fne1 = (ue * ve) * nx_ki + (ve * ve + pe) * ny_ki
+            fne2 = b2 * (ue * nx_ki + ve * ny_ki)
 
-    fn_ext = np.empty((K, n_fp, nv))
-    fn_ext[:, :, 0] = (u_ext**2 + p_ext) * nx + (u_ext * v_ext) * ny
-    fn_ext[:, :, 1] = (u_ext * v_ext) * nx + (v_ext**2 + p_ext) * ny
-    fn_ext[:, :, 2] = beta**2 * (u_ext * nx + v_ext * ny)
-
-    # Rusanov
-    f_num = np.empty((K, n_fp, nv))
-    for v_idx in range(nv):
-        f_num[:, :, v_idx] = (0.5 * (fn_int[:, :, v_idx] + fn_ext[:, :, v_idx])
-                               - 0.5 * lam_max * (q_ext[:, :, v_idx] - q_int[:, :, v_idx]))
+            f_num[k, i, 0] = 0.5 * (fni0 + fne0) - 0.5 * lam * (ue - ui)
+            f_num[k, i, 1] = 0.5 * (fni1 + fne1) - 0.5 * lam * (ve - vi)
+            f_num[k, i, 2] = 0.5 * (fni2 + fne2) - 0.5 * lam * (pe - pi)
 
     return f_num
 
@@ -120,47 +122,58 @@ def ac_numerical_flux(q_int: np.ndarray, q_ext: np.ndarray,
 # Max wavespeed for CFL
 # =============================================================================
 
-def ac_max_wavespeed(q: np.ndarray, beta: float = 1.0) -> float:
+@njit(cache=True)
+def ac_max_wavespeed(q, beta=1.0):
     """Global maximum wavespeed for CFL computation."""
-    u = q[:, :, 0]
-    v = q[:, :, 1]
-    speed = np.sqrt(u**2 + v**2)
-    return float(np.max(speed + np.sqrt(speed**2 + beta**2)))
+    K, Np, _ = q.shape
+    b2 = beta * beta
+    wmax = 0.0
+    for k in range(K):
+        for i in range(Np):
+            u = q[k, i, 0]
+            v = q[k, i, 1]
+            s2 = u * u + v * v
+            s = np.sqrt(s2)
+            w = s + np.sqrt(s2 + b2)
+            if w > wmax:
+                wmax = w
+    return wmax
 
 
 # =============================================================================
 # Boundary conditions
 # =============================================================================
 
+@njit(cache=True, parallel=True)
 def cavity_bc(q_int, q_ext, bc_tags, face_nx, face_ny,
-              lid_velocity=1.0):
+              lid_velocity=1.0, face_x=None):
     """
-    Apply lid-driven cavity BCs.
+    Apply lid-driven cavity BCs (Numba-accelerated).
 
-    bc_tags: (K, 3*Nfp) int array
-        0 = interior (use q_ext as-is from neighbor)
-        1 = wall (no-slip)
-        2 = lid (moving wall)
-
-    For wall: u_ext = -u_int, v_ext = -v_int, p_ext = p_int
-    For lid: u_ext = 2*U_lid - u_int, v_ext = -v_int, p_ext = p_int
+    bc_tags: (K, n_fp) int — 0=interior, 1=wall, 2=lid
+    face_x: (K, n_fp) float — x-coords at face nodes (for regularized lid)
     """
+    K, n_fp, nv = q_int.shape
     q_out = q_ext.copy()
 
-    wall = bc_tags == 1
-    lid = bc_tags == 2
-
-    # No-slip wall
-    if np.any(wall):
-        q_out[wall, 0] = -q_int[wall, 0]
-        q_out[wall, 1] = -q_int[wall, 1]
-        q_out[wall, 2] = q_int[wall, 2]
-
-    # Lid (moving wall)
-    if np.any(lid):
-        q_out[lid, 0] = 2.0 * lid_velocity - q_int[lid, 0]
-        q_out[lid, 1] = -q_int[lid, 1]
-        q_out[lid, 2] = q_int[lid, 2]
+    for k in prange(K):
+        for i in range(n_fp):
+            bc = bc_tags[k, i]
+            if bc == 1:
+                # Wall: no-slip
+                q_out[k, i, 0] = -q_int[k, i, 0]
+                q_out[k, i, 1] = -q_int[k, i, 1]
+                q_out[k, i, 2] = q_int[k, i, 2]
+            elif bc == 2:
+                # Lid: regularized moving wall
+                if face_x is not None:
+                    x = face_x[k, i]
+                    u_lid = lid_velocity * 16.0 * x * x * (1.0 - x) * (1.0 - x)
+                else:
+                    u_lid = lid_velocity
+                q_out[k, i, 0] = 2.0 * u_lid - q_int[k, i, 0]
+                q_out[k, i, 1] = -q_int[k, i, 1]
+                q_out[k, i, 2] = q_int[k, i, 2]
 
     return q_out
 

@@ -31,6 +31,19 @@ from .timestepping.runge_kutta import ssp_rk3
 
 
 @njit(cache=True, parallel=True)
+def _extract_exterior(q, vmapP_k, vmapP_n, Fmask, K, n_fp, nv):
+    """Extract exterior face values from neighbor elements."""
+    q_ext = np.empty((K, n_fp, nv), dtype=np.float64)
+    for k in prange(K):
+        for idx in range(n_fp):
+            pk = vmapP_k[k, idx]
+            pn = vmapP_n[k, idx]
+            for v in range(nv):
+                q_ext[k, idx, v] = q[pk, pn, v]
+    return q_ext
+
+
+@njit(cache=True, parallel=True)
 def _system_rhs_kernel(q, Fx, Fy, Dr, Ds, rx, ry, sx, sy,
                        LIFT, Fmask_flat, nx, ny, Fscale,
                        vmapP_k, vmapP_n, f_num,
@@ -233,28 +246,20 @@ class DG2DSystem:
         n_fp = 3 * Nfp
         Fmask = self.Fmask_flat
 
-        q_int = np.empty((K, n_fp, nv))
-        q_ext = np.empty((K, n_fp, nv))
-
-        for idx in range(n_fp):
-            vol_idx = Fmask[idx]
-            q_int[:, idx, :] = q[:, vol_idx, :]
-            pk = self.vmapP_k[:, idx]
-            pn = self.vmapP_n[:, idx]
-            q_ext[:, idx, :] = q[pk, pn, :]
+        q_int = q[:, Fmask, :]  # (K, n_fp, nv) via fancy indexing
+        q_ext = _extract_exterior(q, self.vmapP_k, self.vmapP_n, Fmask,
+                                  K, n_fp, nv)
 
         # Apply BCs for boundary faces
         if self.bc_func is not None and self.bc_tags is not None:
-            # Expand bc_tags to per-face-node
-            bc_per_node = np.zeros((K, n_fp), dtype=np.int32)
-            for f in range(3):
-                bc_per_node[:, f * Nfp:(f + 1) * Nfp] = self.bc_tags[:, f:f + 1]
+            if not hasattr(self, '_bc_per_node'):
+                self._bc_per_node = np.zeros((K, n_fp), dtype=np.int32)
+                for f in range(3):
+                    self._bc_per_node[:, f * Nfp:(f + 1) * Nfp] = \
+                        self.bc_tags[:, f:f + 1]
 
-            # Face normals at face nodes
-            face_nx = self.nx
-            face_ny = self.ny
-
-            q_ext = self.bc_func(q_int, q_ext, bc_per_node, face_nx, face_ny)
+            q_ext = self.bc_func(q_int, q_ext, self._bc_per_node,
+                                 self.nx, self.ny)
 
         return q_int, q_ext
 
