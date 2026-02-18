@@ -1,9 +1,10 @@
 __pycache__/
 *.pyc
+*.nbc
+*.nbi
 .venv/
 *.egg-info/
 .pytest_cache/
-*.png
 .numba_cache/
 uv.lock
 .openclaw/
