@@ -92,22 +92,13 @@ def run_cavity(nx=16, p=2, Re=100.0, beta=10.0, cfl=0.01,
         numerical_flux=lambda qi, qe, nx_a, ny_a: ac_numerical_flux(qi, qe, nx_a, ny_a, beta),
         max_wavespeed=lambda q: ac_max_wavespeed(q, beta),
         periodic=False,
+        cavity_mode=True,  # Use fast Numba path for BCs
+        lid_velocity=1.0,
     )
 
-    # Boundary conditions
+    # Boundary conditions (bc_tags still needed for viscous operator)
     bc_tags = build_cavity_bc_tags(solver)
     solver.bc_tags = bc_tags
-
-    # Build face x-coordinates for regularized lid BC
-    Fmask_flat = solver.Fmask_flat
-    face_x = np.zeros((solver.K, 3 * solver.Nfp))
-    for i in range(3 * solver.Nfp):
-        face_x[:, i] = solver.x[:, Fmask_flat[i]]
-
-    def bc_func(q_int, q_ext, bc_per_node, face_nx, face_ny):
-        return cavity_bc(q_int, q_ext, bc_per_node, face_nx, face_ny,
-                         lid_velocity=1.0, face_x=face_x)
-    solver.bc_func = bc_func
 
     # BR2 viscous operator
     viscous_func = make_system_viscous_rhs(solver, Re, lid_velocity=1.0)

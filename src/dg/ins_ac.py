@@ -165,13 +165,8 @@ def cavity_bc(q_int, q_ext, bc_tags, face_nx, face_ny,
                 q_out[k, i, 1] = -q_int[k, i, 1]
                 q_out[k, i, 2] = q_int[k, i, 2]
             elif bc == 2:
-                # Lid: regularized moving wall
-                if face_x is not None:
-                    x = face_x[k, i]
-                    u_lid = lid_velocity * 16.0 * x * x * (1.0 - x) * (1.0 - x)
-                else:
-                    u_lid = lid_velocity
-                q_out[k, i, 0] = 2.0 * u_lid - q_int[k, i, 0]
+                # Lid: sharp step function (constant velocity)
+                q_out[k, i, 0] = 2.0 * lid_velocity - q_int[k, i, 0]
                 q_out[k, i, 1] = -q_int[k, i, 1]
                 q_out[k, i, 2] = q_int[k, i, 2]
 

@@ -44,6 +44,45 @@ def _extract_exterior(q, vmapP_k, vmapP_n, Fmask, K, n_fp, nv):
 
 
 @njit(cache=True, parallel=True)
+def _extract_exterior_with_bc(q, vmapP_k, vmapP_n, bc_per_node,
+                               nx, ny, K, n_fp, nv,
+                               lid_velocity):
+    """
+    Extract exterior face values with cavity BCs applied inline.
+
+    bc_tags: 0=interior, 1=wall, 2=lid
+    """
+    q_ext = np.empty((K, n_fp, nv), dtype=np.float64)
+    for k in prange(K):
+        for idx in range(n_fp):
+            ui = q[k, vmapP_n[k, idx] if bc_per_node[k, idx] == 0 else 0, 0]
+            vi = q[k, vmapP_n[k, idx] if bc_per_node[k, idx] == 0 else 0, 1]
+            pi = q[k, vmapP_n[k, idx] if bc_per_node[k, idx] == 0 else 0, 2]
+
+            bc = bc_per_node[k, idx]
+            if bc == 0:
+                # Interior: copy from neighbor
+                pk = vmapP_k[k, idx]
+                pn = vmapP_n[k, idx]
+                q_ext[k, idx, 0] = q[pk, pn, 0]
+                q_ext[k, idx, 1] = q[pk, pn, 1]
+                q_ext[k, idx, 2] = q[pk, pn, 2]
+            elif bc == 1:
+                # Wall: no-slip (mirror velocity, keep pressure)
+                vol_idx = vmapP_n[k, idx]
+                q_ext[k, idx, 0] = -q[k, vol_idx, 0]
+                q_ext[k, idx, 1] = -q[k, vol_idx, 1]
+                q_ext[k, idx, 2] = q[k, vol_idx, 2]
+            else:
+                # Lid: sharp step (constant velocity)
+                vol_idx = vmapP_n[k, idx]
+                q_ext[k, idx, 0] = 2.0 * lid_velocity - q[k, vol_idx, 0]
+                q_ext[k, idx, 1] = -q[k, vol_idx, 1]
+                q_ext[k, idx, 2] = q[k, vol_idx, 2]
+    return q_ext
+
+
+@njit(cache=True, parallel=True)
 def _system_rhs_kernel(q, Fx, Fy, Dr, Ds, rx, ry, sx, sy,
                        LIFT, Fmask_flat, nx, ny, Fscale,
                        vmapP_k, vmapP_n, f_num,
@@ -146,6 +185,8 @@ class DG2DSystem:
         periodic: bool = False,
         x_range: tuple = (0.0, 1.0),
         y_range: tuple = (0.0, 1.0),
+        cavity_mode: bool = False,
+        lid_velocity: float = 1.0,
     ):
         self.mesh = mesh
         self.p = p
@@ -159,6 +200,8 @@ class DG2DSystem:
         self.viscous_rhs = viscous_rhs
         self.bc_func = bc_func
         self.bc_tags = bc_tags
+        self.cavity_mode = cavity_mode
+        self.lid_velocity = lid_velocity
 
         # Reference element
         self.ref = RefTriangle(p)
@@ -230,13 +273,18 @@ class DG2DSystem:
             K, Np, Nfp, nv,
         )
 
-    def _extract_face_values(self, q: np.ndarray):
+    def _extract_face_values(self, q: np.ndarray, use_cavity_bc: bool = False,
+                              lid_velocity: float = 1.0):
         """
         Extract interior and exterior face values from q.
 
         Parameters
         ----------
         q : ndarray, shape (K, Np, n_vars)
+        use_cavity_bc : bool
+            If True, use fused Numba kernel for cavity BCs (no Python callback).
+        lid_velocity : float
+            Lid velocity for cavity BCs.
 
         Returns
         -------
@@ -247,19 +295,31 @@ class DG2DSystem:
         Fmask = self.Fmask_flat
 
         q_int = q[:, Fmask, :]  # (K, n_fp, nv) via fancy indexing
-        q_ext = _extract_exterior(q, self.vmapP_k, self.vmapP_n, Fmask,
-                                  K, n_fp, nv)
 
-        # Apply BCs for boundary faces
-        if self.bc_func is not None and self.bc_tags is not None:
+        if use_cavity_bc and self.bc_tags is not None:
+            # Use fused Numba kernel (no Python callback)
             if not hasattr(self, '_bc_per_node'):
                 self._bc_per_node = np.zeros((K, n_fp), dtype=np.int32)
                 for f in range(3):
                     self._bc_per_node[:, f * Nfp:(f + 1) * Nfp] = \
                         self.bc_tags[:, f:f + 1]
-
-            q_ext = self.bc_func(q_int, q_ext, self._bc_per_node,
-                                 self.nx, self.ny)
+            q_ext = _extract_exterior_with_bc(
+                q, self.vmapP_k, self.vmapP_n, self._bc_per_node,
+                self.nx, self.ny, K, n_fp, nv, lid_velocity
+            )
+        else:
+            # Use generic extraction + Python callback
+            q_ext = _extract_exterior(q, self.vmapP_k, self.vmapP_n, Fmask,
+                                      K, n_fp, nv)
+            # Apply BCs for boundary faces
+            if self.bc_func is not None and self.bc_tags is not None:
+                if not hasattr(self, '_bc_per_node'):
+                    self._bc_per_node = np.zeros((K, n_fp), dtype=np.int32)
+                    for f in range(3):
+                        self._bc_per_node[:, f * Nfp:(f + 1) * Nfp] = \
+                            self.bc_tags[:, f:f + 1]
+                q_ext = self.bc_func(q_int, q_ext, self._bc_per_node,
+                                     self.nx, self.ny)
 
         return q_int, q_ext
 
@@ -280,8 +340,12 @@ class DG2DSystem:
         Fx = self._flux_x(q)
         Fy = self._flux_y(q)
 
-        # Face values
-        q_int, q_ext = self._extract_face_values(q)
+        # Face values (use fast Numba path for cavity BCs)
+        q_int, q_ext = self._extract_face_values(
+            q,
+            use_cavity_bc=self.cavity_mode,
+            lid_velocity=self.lid_velocity
+        )
 
         # Numerical flux at faces
         f_num = self._numerical_flux(q_int, q_ext, self.nx, self.ny)

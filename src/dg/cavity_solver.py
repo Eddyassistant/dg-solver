@@ -96,10 +96,8 @@ def _cavity_rhs(q, Dr, Ds, rx, ry, sx, sy, LIFT, Fmask_flat,
                 ve = -vi
                 pe = pi
             else:
-                # Lid: regularized
-                x = face_x[k, fpt]
-                u_lid = lid_vel * 16.0 * x * x * (1.0 - x) * (1.0 - x)
-                ue = 2.0 * u_lid - ui
+                # Lid: sharp step function (constant velocity)
+                ue = 2.0 * lid_vel - ui
                 ve = -vi
                 pe = pi
 
