@@ -4,6 +4,13 @@ BR2 (Bassi-Rebay 2) viscous flux operator for 2D DG.
 The BR2 method computes viscous fluxes using an auxiliary variable σ = ∇u,
 computed via a lifting operator that accounts for solution jumps across faces.
 
+BR2 formulation:
+    σ = ∇u - r_f([[u]])   (local element-wise correction)
+    
+where r_f is the lifting operator for each face f, and [[u]] is the jump.
+
+The viscous flux is then computed using the BR2-corrected gradient σ.
+
 References
 ----------
 Bassi & Rebay (2000), J. Comput. Phys. 131, pp. 267-279.
@@ -26,30 +33,16 @@ from .timestepping.runge_kutta import ssp_rk3
 # =============================================================================
 
 @njit(cache=True, parallel=True)
-def _compute_lifted_gradient_kernel(u, Dr, Ds, rx, ry, sx, sy,
-                                    LIFT, Fmask_flat, nx, ny, Fscale,
-                                    vmapP_k, vmapP_n, K, Np, Nfp):
+def _compute_element_gradient(u, Dr, Ds, rx, ry, sx, sy, K, Np):
     """
-    Compute BR2 lifting corrections for gradients.
+    Compute local element gradients (no lifting corrections).
     
-    Returns σ = ∇u with BR2 lifting for jumps.
-    
-    The auxiliary variable σ is computed as:
-        σ = ∇u - r_e([u])
-    where r_e is the lifting operator applied to jumps at faces.
-    
-    For each element k:
-        - First compute the volume gradient ∇u
-        - Then compute face jumps and apply lifting
+    Returns volume gradients (∂u/∂x, ∂u/∂y) for each element.
     """
-    # Storage for gradient components (ux, uy)
     ux = np.empty((K, Np), dtype=np.float64)
     uy = np.empty((K, Np), dtype=np.float64)
     
-    n_face_pts = 3 * Nfp
-    
     for k in prange(K):
-        # --- Volume gradient: ∇u on reference, then map to physical ---
         rx_k = rx[k, 0]
         ry_k = ry[k, 0]
         sx_k = sx[k, 0]
@@ -63,36 +56,62 @@ def _compute_lifted_gradient_kernel(u, Dr, Ds, rx, ry, sx, sy,
                 duds += Ds[i, j] * u[k, j]
             ux[k, i] = rx_k * dudr + sx_k * duds
             uy[k, i] = ry_k * dudr + sy_k * duds
-        
-        # --- Face corrections: compute jumps and lift them ---
-        # Jump at face: [u] = u_int - u_ext (normal is outward from int)
-        # BR2 lifting: r_e applied to average of traces
-        # For DG viscous, we need: {{∇u}} - η r_e([u])
-        
-        # Compute jumps for each face point
+    
+    return ux, uy
+
+
+@njit(cache=True, parallel=True)
+def _compute_br2_gradient(u, Dr, Ds, rx, ry, sx, sy,
+                          LIFT, Fmask_flat, nx, ny, Fscale,
+                          vmapP_k, vmapP_n, K, Np, Nfp, eta=1.0):
+    """
+    Compute BR2-corrected gradient σ = ∇u - Σ_f r_f([[u]]).
+    
+    The BR2 lifting operator r_f for face f satisfies:
+        ∫_K r_f(τ) · v dV = ∫_f [[τ]] · {{v}} ds
+    
+    For DG implementation with nodal basis, this becomes:
+        σ = ∇u - LIFT @ (Fscale * [[u]] * n / 2)
+    
+    where:
+    - [[u]] = u⁻ - u⁺ is the jump (scalar)
+    - n is the outward normal
+    - The factor 1/2 comes from the averaging operator {{v}}
+    
+    Parameters
+    ----------
+    eta : float
+        BR2 stabilization parameter (default 1.0 for full correction).
+    """
+    # First compute volume gradients
+    ux, uy = _compute_element_gradient(u, Dr, Ds, rx, ry, sx, sy, K, Np)
+    
+    n_face_pts = 3 * Nfp
+    
+    # Apply BR2 lifting corrections
+    for k in prange(K):
+        # Compute jumps at faces: [[u]] = u⁻ - u⁺
         jumps = np.empty(n_face_pts, dtype=np.float64)
-        for i in range(n_face_pts):
-            vol_idx = Fmask_flat[i]
-            pk = vmapP_k[k, i]
-            pn = vmapP_n[k, i]
-            u_int = u[k, vol_idx]
-            u_ext = u[pk, pn]
-            # Outward normal from element k
-            jumps[i] = u_int - u_ext  # [u] = u^- - u^+
+        for fpt in range(n_face_pts):
+            vol_idx = Fmask_flat[fpt]
+            pk = vmapP_k[k, fpt]
+            pn = vmapP_n[k, fpt]
+            u_minus = u[k, vol_idx]
+            u_plus = u[pk, pn]
+            jumps[fpt] = u_minus - u_plus  # [[u]] at face point
         
-        # LIFT @ (Fscale * jumps / 2) - correction for averaging
-        # The BR2 method uses: σ = ∇u - LIFT @ (Fscale * [u] / 2 * n)
-        # We compute this as a correction to the gradient
+        # Apply lifting: subtract LIFT @ (Fscale * [[u]] * n / 2 * eta)
         for i in range(Np):
             lift_x = 0.0
             lift_y = 0.0
-            for j in range(n_face_pts):
-                # LIFT contribution weighted by face normal
-                # The jump [u] is scalar; we need to project onto normal
-                # Correction to gradient: r_e([u]) contributes to both components
-                lift_weight = LIFT[i, j] * Fscale[k, j] * 0.5 * jumps[j]
-                lift_x += lift_weight * nx[k, j]
-                lift_y += lift_weight * ny[k, j]
+            for fpt in range(n_face_pts):
+                # LIFT[i, fpt] gives contribution from face point to volume node i
+                # Fscale[k, fpt] = sJ / |J| (face Jacobian / volume Jacobian)
+                # [[u]] * n / 2 is the jump projected onto normal, averaged
+                weight = LIFT[i, fpt] * Fscale[k, fpt] * 0.5 * eta * jumps[fpt]
+                lift_x += weight * nx[k, fpt]
+                lift_y += weight * ny[k, fpt]
+            
             ux[k, i] -= lift_x
             uy[k, i] -= lift_y
     
@@ -100,21 +119,22 @@ def _compute_lifted_gradient_kernel(u, Dr, Ds, rx, ry, sx, sy,
 
 
 @njit(cache=True, parallel=True)
-def _compute_viscous_rhs_kernel(ux, uy, nu, Dr, Ds, rx, ry, sx, sy,
-                                LIFT, Fmask_flat, nx, ny, Fscale,
-                                vmapP_k, vmapP_n, K, Np, Nfp):
+def _compute_viscous_rhs(u, ux, uy, nu, Dr, Ds, rx, ry, sx, sy,
+                         LIFT, Fmask_flat, nx, ny, Fscale,
+                         vmapP_k, vmapP_n, K, Np, Nfp):
     """
-    Compute viscous RHS: ∇·(ν∇u) using BR2 formulation.
+    Compute viscous RHS: ∇·(ν∇u) using BR2-corrected gradients.
     
-    Returns rhs_visc[k] = ∫_K ∇φ·(ν∇u) dA - face_corrections
+    Using the weak formulation:
+        ∫_K φ ∂u/∂t dV = -∫_K ∇φ · (νσ) dV + ∮_∂K φ (νσ* · n) ds
     
-    Using integration by parts (weak form):
-        ∫_K φ ∇·(ν∇u) dV = -∫_K ∇φ·(ν∇u) dV + ∮_∂K φ (ν∇u·n) ds
+    where σ* is the numerical flux for the viscous term.
     
-    In DG form with numerical flux for ∇u:
-        rhs = -∫_K ∇φ·(νσ) dV + ∮_∂K φ (νσ̂·n) ds
+    For BR2, we use:
+        σ* = {{σ}}   (average of corrected gradients)
     
-    where σ̂ = {{σ}} is the average of the BR2-corrected gradients.
+    Returns:
+        rhs[k, i] = -∫_K ∇φ_i · (νσ) dV + ∮_∂K φ_i (ν{{σ}} · n) ds
     """
     rhs = np.empty((K, Np), dtype=np.float64)
     n_face_pts = 3 * Nfp
@@ -125,179 +145,61 @@ def _compute_viscous_rhs_kernel(ux, uy, nu, Dr, Ds, rx, ry, sx, sy,
         sx_k = sx[k, 0]
         sy_k = sy[k, 0]
         
-        # --- Volume term: -∫ ∇φ·(νσ) dV ---
-        # = -|J| * (rx*Dr + sx*Ds) @ (ν*ux) - |J| * (ry*Dr + sy*Ds) @ (ν*uy)
+        # --- Volume term: -∫_K ∇φ · (νσ) dV ---
+        # = -|J| * [(rx*Dr + sx*Ds) @ (ν*ux) + (ry*Dr + sy*Ds) @ (ν*uy)]
         vol = np.empty(Np, dtype=np.float64)
         
         for i in range(Np):
-            dfx_dr = 0.0
-            dfx_ds = 0.0
-            dfy_dr = 0.0
-            dfy_ds = 0.0
-            nu_ux = nu * ux[k, :]
-            nu_uy = nu * uy[k, :]
-            for j in range(Np):
-                dfx_dr += Dr[i, j] * nu_ux[j]
-                dfx_ds += Ds[i, j] * nu_ux[j]
-                dfy_dr += Dr[i, j] * nu_uy[j]
-                dfy_ds += Ds[i, j] * nu_uy[j]
-            
-            # ∇·(ν∇u) divergence
-            d_nux_dx = rx_k * dfx_dr + sx_k * dfx_ds
-            d_nuy_dy = ry_k * dfy_dr + sy_k * dfy_ds
-            vol[i] = -(d_nux_dx + d_nuy_dy)  # Negative for weak form
-        
-        # --- Surface term: +∮ φ (νσ̂·n) ds ---
-        # Numerical flux for viscous: {{νσ}}·n = ½(νσ⁻·n + νσ⁺·n)
-        surf_corr = np.empty(n_face_pts, dtype=np.float64)
-        
-        for i in range(n_face_pts):
-            vol_idx = Fmask_flat[i]
-            pk = vmapP_k[k, i]
-            pn = vmapP_n[k, i]
-            
-            # Interior trace
-            sigma_n_int = ux[k, vol_idx] * nx[k, i] + uy[k, vol_idx] * ny[k, i]
-            
-            # Exterior trace
-            sigma_n_ext = ux[pk, pn] * nx[k, i] + uy[pk, pn] * ny[k, i]
-            
-            # Average flux {{σ}}·n
-            sigma_n_avg = 0.5 * (sigma_n_int + sigma_n_ext)
-            
-            # Viscous flux at face: ν * {{σ}}·n
-            visc_flux = nu * sigma_n_avg
-            
-            # Physical flux minus numerical flux for DG residual
-            # The residual contribution is: (phys_flux - num_flux)
-            # For viscous with average flux, phys_flux = νσ⁻·n, num_flux = ν{{σ}}·n
-            phys_flux = nu * sigma_n_int
-            surf_corr[i] = Fscale[k, i] * (visc_flux - phys_flux)
-            # Note: The sign convention gives us (num_flux - phys_flux) for the jump
-            # Actually we want: +num_flux in the surface integral
-            # Let me reconsider...
-        
-        # Recompute surface contribution correctly
-        for i in range(n_face_pts):
-            vol_idx = Fmask_flat[i]
-            pk = vmapP_k[k, i]
-            pn = vmapP_n[k, i]
-            
-            # Interior trace of σ·n
-            sigma_n_int = ux[k, vol_idx] * nx[k, i] + uy[k, vol_idx] * ny[k, i]
-            
-            # Exterior trace (note: neighbor's outward normal is opposite)
-            # For the neighbor, the normal is flipped, but we use same (nx, ny)
-            # so σ⁺·n here means the value from neighbor dotted with our normal
-            sigma_n_ext = ux[pk, pn] * nx[k, i] + uy[pk, pn] * ny[k, i]
-            
-            # Average: {{σ}}·n = ½(σ⁻·n + σ⁺·n)
-            sigma_n_avg = 0.5 * (sigma_n_int + sigma_n_ext)
-            
-            # DG surface term: Fscale * ({{νσ}}·n - νσ⁻·n)
-            # = Fscale * ν * ({{σ}}·n - σ⁻·n)
-            # = Fscale * ν * ½(σ⁺·n - σ⁻·n)
-            surf_corr[i] = Fscale[k, i] * nu * (sigma_n_avg - sigma_n_int)
-        
-        # LIFT @ surf_corr + volume term
-        for i in range(Np):
-            val = vol[i]
-            for j in range(n_face_pts):
-                val += LIFT[i, j] * surf_corr[j]
-            rhs[k, i] = val
-    
-    return rhs
-
-
-@njit(cache=True, parallel=True)
-def _compute_laplacian_direct_kernel(u, Dr, Ds, rx, ry, sx, sy,
-                                     LIFT, Fmask_flat, nx, ny, Fscale,
-                                     vmapP_k, vmapP_n, nu, K, Np, Nfp):
-    """
-    Direct Laplacian computation for comparison/testing.
-    
-    This computes ν∇²u using BR2-corrected gradients for the viscous flux.
-    """
-    rhs = np.empty((K, Np), dtype=np.float64)
-    n_face_pts = 3 * Nfp
-    
-    for k in prange(K):
-        # --- Step 1: Compute BR2-corrected gradient σ = ∇u ---
-        rx_k = rx[k, 0]
-        ry_k = ry[k, 0]
-        sx_k = sx[k, 0]
-        sy_k = sy[k, 0]
-        
-        # Volume gradient
-        ux = np.empty(Np, dtype=np.float64)
-        uy = np.empty(Np, dtype=np.float64)
-        
-        for i in range(Np):
-            dudr = 0.0
-            duds = 0.0
-            for j in range(Np):
-                dudr += Dr[i, j] * u[k, j]
-                duds += Ds[i, j] * u[k, j]
-            ux[i] = rx_k * dudr + sx_k * duds
-            uy[i] = ry_k * dudr + sy_k * duds
-        
-        # --- Step 2: Lifting corrections (BR2) ---
-        for i in range(n_face_pts):
-            vol_idx = Fmask_flat[i]
-            pk = vmapP_k[k, i]
-            pn = vmapP_n[k, i]
-            jump = u[k, vol_idx] - u[pk, pn]
-            
-            # Apply lifting correction to gradient
-            for j in range(Np):
-                lift_weight = LIFT[j, i] * Fscale[k, i] * 0.5 * jump
-                ux[j] -= lift_weight * nx[k, i]
-                uy[j] -= lift_weight * ny[k, i]
-        
-        # --- Step 3: Compute divergence of (ν∇u) ---
-        # Volume term: -∇·(νσ)
-        for i in range(Np):
+            # Compute divergence of (νσ)
             d_nux_dr = 0.0
             d_nux_ds = 0.0
             d_nuy_dr = 0.0
             d_nuy_ds = 0.0
             
             for j in range(Np):
-                d_nux_dr += Dr[i, j] * ux[j]
-                d_nux_ds += Ds[i, j] * ux[j]
-                d_nuy_dr += Dr[i, j] * uy[j]
-                d_nuy_ds += Ds[i, j] * uy[j]
+                d_nux_dr += Dr[i, j] * nu * ux[k, j]
+                d_nux_ds += Ds[i, j] * nu * ux[k, j]
+                d_nuy_dr += Dr[i, j] * nu * uy[k, j]
+                d_nuy_ds += Ds[i, j] * nu * uy[k, j]
             
-            d_nux_dx = rx_k * d_nux_dr + sx_k * d_nux_ds
-            d_nuy_dy = ry_k * d_nuy_dr + sy_k * d_nuy_ds
-            rhs[k, i] = -nu * (d_nux_dx + d_nuy_dy)
+            div_nsigma_x = rx_k * d_nux_dr + sx_k * d_nux_ds
+            div_nsigma_y = ry_k * d_nuy_dr + sy_k * d_nuy_ds
+            
+            # Volume contribution: -∇·(νσ)
+            vol[i] = -(div_nsigma_x + div_nsigma_y)
         
-        # Surface term: correction for ∇u at faces
-        # We need to apply the lifting again for the test function
-        # This gives the symmetric interior penalty-like correction
+        # --- Surface term: +∮_∂K φ (ν{{σ}} · n) ds ---
+        # DG surface flux: compute difference between numerical and physical flux
+        # The numerical flux is {{σ}} · n (average of traces)
+        # The physical flux is σ⁻ · n (interior trace)
+        
         surf = np.empty(n_face_pts, dtype=np.float64)
         
-        for i in range(n_face_pts):
-            vol_idx = Fmask_flat[i]
-            pk = vmapP_k[k, i]
-            pn = vmapP_n[k, i]
+        for fpt in range(n_face_pts):
+            vol_idx = Fmask_flat[fpt]
+            pk = vmapP_k[k, fpt]
+            pn = vmapP_n[k, fpt]
             
-            # Traces of corrected gradient
-            sigma_n_int = ux[vol_idx] * nx[k, i] + uy[vol_idx] * ny[k, i]
+            # Interior trace: σ⁻ · n
+            sigma_n_minus = ux[k, vol_idx] * nx[k, fpt] + uy[k, vol_idx] * ny[k, fpt]
             
-            # Need neighbor's corrected gradient for average
-            # For simplicity in this direct version, use uncorrected neighbor
-            sigma_n_ext = (ux[pk, pn] if pk < K else ux[vol_idx]) * nx[k, i] + \
-                          (uy[pk, pn] if pk < K else uy[vol_idx]) * ny[k, i]
+            # Exterior trace: σ⁺ · n (using the same normal n, which points outward from k)
+            sigma_n_plus = ux[pk, pn] * nx[k, fpt] + uy[pk, pn] * ny[k, fpt]
             
-            # Average minus interior
-            avg_jump = 0.5 * (sigma_n_ext - sigma_n_int)
-            surf[i] = Fscale[k, i] * nu * avg_jump
+            # Average: {{σ}} · n = ½(σ⁻·n + σ⁺·n)
+            sigma_n_avg = 0.5 * (sigma_n_minus + sigma_n_plus)
+            
+            # Surface contribution for DG: Fscale * ({{νσ}}·n - νσ⁻·n)
+            # = Fscale * ν * ({{σ}}·n - σ⁻·n)
+            # = Fscale * ν * ½(σ⁺·n - σ⁻·n)
+            surf[fpt] = Fscale[k, fpt] * nu * (sigma_n_avg - sigma_n_minus)
         
-        # Add surface contribution
+        # --- Combine volume and surface terms using LIFT ---
         for i in range(Np):
-            for j in range(n_face_pts):
-                rhs[k, i] += LIFT[i, j] * surf[j]
+            val = vol[i]
+            for fpt in range(n_face_pts):
+                val += LIFT[i, fpt] * surf[fpt]
+            rhs[k, i] = val
     
     return rhs
 
@@ -410,7 +312,7 @@ class BR2ViscousFlux:
         u = np.zeros((K, Np))
         
         # Warmup gradient kernel
-        _compute_lifted_gradient_kernel(
+        _compute_br2_gradient(
             u, self.Dr, self.Ds, self.rx, self.ry, self.sx, self.sy,
             self.LIFT, self.Fmask_flat, self.nx, self.ny, self.Fscale,
             self.vmapP_k, self.vmapP_n, K, Np, Nfp
@@ -418,10 +320,29 @@ class BR2ViscousFlux:
         
         # Warmup RHS kernel
         ux = np.zeros((K, Np))
-        _compute_viscous_rhs_kernel(
-            ux, ux, self.nu, self.Dr, self.Ds, self.rx, self.ry, self.sx, self.sy,
+        _compute_viscous_rhs(
+            u, ux, ux, self.nu, self.Dr, self.Ds, self.rx, self.ry, self.sx, self.sy,
             self.LIFT, self.Fmask_flat, self.nx, self.ny, self.Fscale,
             self.vmapP_k, self.vmapP_n, K, Np, Nfp
+        )
+    
+    def compute_gradient(self, u: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Compute element-wise gradient (no BR2 lifting).
+        
+        Parameters
+        ----------
+        u : ndarray, shape (K, Np)
+            Solution field.
+        
+        Returns
+        -------
+        ux, uy : tuple of ndarray, shape (K, Np)
+            Gradient components without lifting corrections.
+        """
+        return _compute_element_gradient(
+            u, self.Dr, self.Ds, self.rx, self.ry, self.sx, self.sy,
+            self.K, self.Np
         )
     
     def compute_lifted_gradient(self, u: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -429,7 +350,7 @@ class BR2ViscousFlux:
         Compute BR2-corrected gradient σ = ∇u.
         
         The gradient includes lifting corrections from face jumps:
-            σ = ∇u - r_e([u])
+            σ = ∇u - Σ_f r_f([[u]])
         
         Parameters
         ----------
@@ -441,7 +362,7 @@ class BR2ViscousFlux:
         ux, uy : tuple of ndarray, shape (K, Np)
             Gradient components with BR2 corrections.
         """
-        return _compute_lifted_gradient_kernel(
+        return _compute_br2_gradient(
             u, self.Dr, self.Ds, self.rx, self.ry, self.sx, self.sy,
             self.LIFT, self.Fmask_flat, self.nx, self.ny, self.Fscale,
             self.vmapP_k, self.vmapP_n, self.K, self.Np, self.Nfp
@@ -467,8 +388,8 @@ class BR2ViscousFlux:
         ux, uy = self.compute_lifted_gradient(u)
         
         # Step 2: Compute divergence
-        rhs = _compute_viscous_rhs_kernel(
-            ux, uy, self.nu, self.Dr, self.Ds, self.rx, self.ry, self.sx, self.sy,
+        rhs = _compute_viscous_rhs(
+            u, ux, uy, self.nu, self.Dr, self.Ds, self.rx, self.ry, self.sx, self.sy,
             self.LIFT, self.Fmask_flat, self.nx, self.ny, self.Fscale,
             self.vmapP_k, self.vmapP_n, self.K, self.Np, self.Nfp
         )
@@ -491,8 +412,8 @@ class BR2ViscousFlux:
         laplacian : ndarray, shape (K, Np)
             Laplacian of u.
         """
-        rhs = self.compute_rhs(u) / self.nu
-        return rhs
+        rhs = self.compute_rhs(u)
+        return rhs / self.nu
     
     def solve_diffusion(
         self,
