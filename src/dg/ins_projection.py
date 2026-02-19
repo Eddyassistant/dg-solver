@@ -514,18 +514,27 @@ def assemble_sipg_laplacian_full(solver, sigma_ip=None):
                 
                 fs = Fscale[k, fpt]
                 hk = 1.0 / fs
+                
+                # Penalty parameter: σ/h
                 tau = sigma_ip / hk
                 
-                # Penalty term: τ/h * [[φ]] [[ψ]]
-                # Contribution to diagonal
-                rows.append(global_idx(k, vol_i))
-                cols.append(global_idx(k, vol_i))
-                vals.append(tau * hk)
+                # Penalty term: τ * [[φ]] [[ψ]] = τ * (φ_k - φ_pk) * (ψ_k - ψ_pk)
+                # This gives:
+                #   τ * φ_k * ψ_k on diagonal (k,k)
+                #  -τ * φ_k * ψ_pk on off-diagonal (k,pk)
                 
-                # Coupling with neighbor
-                rows.append(global_idx(k, vol_i))
-                cols.append(global_idx(pk, pn))
-                vals.append(-tau * hk)
+                gi = global_idx(k, vol_i)
+                gpn = global_idx(pk, pn)
+                
+                # Diagonal contribution
+                rows.append(gi)
+                cols.append(gi)
+                vals.append(tau)
+                
+                # Off-diagonal contribution
+                rows.append(gi)
+                cols.append(gpn)
+                vals.append(-tau)
     
     # Build sparse matrix
     A = sparse.coo_matrix((vals, (rows, cols)), shape=(n_dof, n_dof))
@@ -703,10 +712,8 @@ class ProjectionDGSolver:
     def _build_pressure_matrix(self):
         """Build and factorize the pressure Poisson matrix."""
         # Use full SIPG Laplacian with element coupling
-        A = assemble_sipg_laplacian_full(self)
-        
-        # Symmetrize
-        A = 0.5 * (A + A.T)
+        sigma_ip = 100.0  # Large penalty for stability
+        A = assemble_sipg_laplacian_full(self, sigma_ip=sigma_ip)
         
         # Pin one DOF to make system non-singular
         # For Neumann BCs, solution is unique up to constant
@@ -980,11 +987,13 @@ class ProjectionDGSolver:
         # Pin one DOF
         rhs[self.pinned_dof] = 0.0
         
-        # Solve using CG
-        phi_flat, info = cg(self.A_pressure, rhs, rtol=1e-10, maxiter=1000)
+        # Solve using CG with higher tolerance and more iterations
+        phi_flat, info = cg(self.A_pressure, rhs, rtol=1e-8, maxiter=5000, M=None)
         
         if info != 0:
-            print(f"Warning: CG did not converge (info={info})")
+            # If CG fails, try using a direct solver
+            from scipy.sparse.linalg import spsolve
+            phi_flat = spsolve(self.A_pressure, rhs)
         
         return phi_flat.reshape((K, Np))
     
