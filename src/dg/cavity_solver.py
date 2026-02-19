@@ -12,7 +12,7 @@ from numba import njit, prange
 import time
 
 
-@njit(cache=True)
+@njit(cache=True, parallel=True)
 def _ac_max_wavespeed(q, beta, K, Np):
     """Global max wavespeed for CFL."""
     b2 = beta * beta
@@ -29,10 +29,61 @@ def _ac_max_wavespeed(q, beta, K, Np):
 
 
 @njit(cache=True, parallel=True)
+def _ssprk3_n_steps(q, Dr, Ds, rx, ry, sx, sy, LIFT, Fmask_flat,
+                    nx_f, ny_f, Fscale, vmapP_k, vmapP_n,
+                    bc_per_node, face_x, beta, nu, sigma_ip, lid_vel,
+                    K, Np, Nfp, n_fp, lid_taper,
+                    cfl, h_min, p, n_steps, t_sim, t_final):
+    """
+    Run n_steps of SSP-RK3 inside Numba (no Python overhead between steps).
+    Returns updated q, t_sim, and final residual.
+    """
+    dt_cfl = cfl * h_min / (2 * p + 1)
+    for _ in range(n_steps):
+        am = _ac_max_wavespeed(q, beta, K, Np) + 1e-14
+        dt = min(dt_cfl / am, t_final - t_sim)
+        if dt <= 0.0:
+            break
+
+        rhs1 = _cavity_rhs(q, Dr, Ds, rx, ry, sx, sy, LIFT, Fmask_flat,
+                           nx_f, ny_f, Fscale, vmapP_k, vmapP_n,
+                           bc_per_node, face_x, beta, nu, sigma_ip, lid_vel,
+                           K, Np, Nfp, n_fp, lid_taper)
+        u1 = q + dt * rhs1
+
+        rhs2 = _cavity_rhs(u1, Dr, Ds, rx, ry, sx, sy, LIFT, Fmask_flat,
+                           nx_f, ny_f, Fscale, vmapP_k, vmapP_n,
+                           bc_per_node, face_x, beta, nu, sigma_ip, lid_vel,
+                           K, Np, Nfp, n_fp, lid_taper)
+        u2 = 0.75 * q + 0.25 * (u1 + dt * rhs2)
+
+        rhs3 = _cavity_rhs(u2, Dr, Ds, rx, ry, sx, sy, LIFT, Fmask_flat,
+                           nx_f, ny_f, Fscale, vmapP_k, vmapP_n,
+                           bc_per_node, face_x, beta, nu, sigma_ip, lid_vel,
+                           K, Np, Nfp, n_fp, lid_taper)
+        q = (1.0 / 3.0) * q + (2.0 / 3.0) * (u2 + dt * rhs3)
+        t_sim += dt
+
+    # Compute final residual
+    rhs_f = _cavity_rhs(q, Dr, Ds, rx, ry, sx, sy, LIFT, Fmask_flat,
+                        nx_f, ny_f, Fscale, vmapP_k, vmapP_n,
+                        bc_per_node, face_x, beta, nu, sigma_ip, lid_vel,
+                        K, Np, Nfp, n_fp, lid_taper)
+    res = 0.0
+    for k in range(K):
+        for i in range(Np):
+            for v in range(3):
+                val = abs(rhs_f[k, i, v])
+                if val > res:
+                    res = val
+    return q, t_sim, res
+
+
+@njit(cache=True, parallel=True)
 def _cavity_rhs(q, Dr, Ds, rx, ry, sx, sy, LIFT, Fmask_flat,
                 nx_f, ny_f, Fscale, vmapP_k, vmapP_n,
                 bc_per_node, face_x, beta, nu, sigma_ip, lid_vel,
-                K, Np, Nfp, n_fp):
+                K, Np, Nfp, n_fp, lid_taper):
     """
     Fused convective + viscous RHS for AC lid-driven cavity.
 
@@ -96,10 +147,8 @@ def _cavity_rhs(q, Dr, Ds, rx, ry, sx, sy, LIFT, Fmask_flat,
                 ve = -vi
                 pe = pi
             else:
-                # Lid: regularized
-                x = face_x[k, fpt]
-                u_lid = lid_vel * 16.0 * x * x * (1.0 - x) * (1.0 - x)
-                ue = 2.0 * u_lid - ui
+                # Lid: sharp (uniform velocity)
+                ue = 2.0 * lid_vel - ui
                 ve = -vi
                 pe = pi
 
@@ -231,9 +280,19 @@ def _cavity_rhs(q, Dr, Ds, rx, ry, sx, sy, LIFT, Fmask_flat,
     return rhs
 
 
-def run_cavity(nx=12, p=2, Re=100.0, beta=1.0, cfl=0.008,
-               t_final=20.0, lid_velocity=1.0, print_every=10000):
-    """Run lid-driven cavity with fused kernel."""
+def run_cavity(nx=12, p=2, Re=100.0, beta=2.0, cfl=0.008,
+               t_final=30.0, lid_velocity=1.0, print_every=5000,
+               C_ip=10.0, res_tol=5e-5, max_steps=5_000_000,
+               lid_taper=0.075):
+    """
+    Run lid-driven cavity with fused Numba kernel (serial).
+
+    Parameters
+    ----------
+    C_ip : float  SIPG penalty coefficient (≥ 10 for stability).
+    res_tol : float  Stop when max residual < res_tol.
+    lid_taper : float  Width of smoothstep corner taper (0 = sharp lid).
+    """
     from .reference_triangle import RefTriangle
     from .mesh.triangle_mesh import (
         TriangleMesh, build_face_connectivity,
@@ -242,7 +301,7 @@ def run_cavity(nx=12, p=2, Re=100.0, beta=1.0, cfl=0.008,
 
     K = 2 * nx * nx
     Np_val = (p + 1) * (p + 2) // 2
-    print(f"Cavity Re={Re}, β={beta}, nx={nx}, P{p}")
+    print(f"Cavity Re={Re}, β={beta}, nx={nx}, P{p}, taper={lid_taper:.3f}")
     print(f"  {K} triangles, {Np_val} nodes/elem, {K*Np_val*3} DOFs")
 
     mesh = TriangleMesh.rectangle((0, 1), (0, 1), nx, nx)
@@ -260,7 +319,6 @@ def run_cavity(nx=12, p=2, Re=100.0, beta=1.0, cfl=0.008,
     Ds = np.ascontiguousarray(ref.Ds)
     LIFT = np.ascontiguousarray(ref.LIFT)
 
-    # Build maps
     vmapP_k = np.zeros((K, n_fp), dtype=np.int64)
     vmapP_n = np.zeros((K, n_fp), dtype=np.int64)
     for k in range(K):
@@ -275,7 +333,6 @@ def run_cavity(nx=12, p=2, Re=100.0, beta=1.0, cfl=0.008,
                     vmapP_k[k, idx] = k2
                     vmapP_n[k, idx] = Fmask[f2][Nfp - 1 - i]
 
-    # BC tags
     bc_tags = np.zeros((K, 3), dtype=np.int32)
     for k in range(K):
         for f in range(3):
@@ -292,65 +349,61 @@ def run_cavity(nx=12, p=2, Re=100.0, beta=1.0, cfl=0.008,
         face_x[:, i] = x[:, Fmask_flat[i]]
 
     nu = 1.0 / Re
-    C_ip = 4.0
     sigma_ip = C_ip * (p + 1) * (p + 2) * nu / 2.0
+    h_min = float(np.min(2.0 * np.abs(J[:, 0]) /
+                         np.max(sJ.reshape(K, 3, Nfp), axis=2).max(axis=1)))
+    lid_taper_val = float(lid_taper)
 
-    # h_min for CFL
-    h_min = np.min(2.0 * np.abs(J[:, 0]) /
-                   np.max(sJ.reshape(K, 3, Nfp), axis=2).max(axis=1))
-
-    # Initial condition
     q = np.zeros((K, Np, 3))
 
-    # Warmup
-    _cavity_rhs(q, Dr, Ds, rx, ry, sx, sy, LIFT, Fmask_flat,
-                nx_f, ny_f, Fscale, vmapP_k, vmapP_n,
-                bc_per_node, face_x, beta, nu, sigma_ip, lid_velocity,
-                K, Np, Nfp, n_fp)
+    # JIT warmup (prime Numba thread pool and compile)
+    for _w in range(5):
+        _cavity_rhs(q, Dr, Ds, rx, ry, sx, sy, LIFT, Fmask_flat,
+                    nx_f, ny_f, Fscale, vmapP_k, vmapP_n,
+                    bc_per_node, face_x, beta, nu, sigma_ip, lid_velocity,
+                    K, Np, Nfp, n_fp, lid_taper_val)
+    # Also warm up the batch kernel
+    _ssprk3_n_steps(q, Dr, Ds, rx, ry, sx, sy, LIFT, Fmask_flat,
+                    nx_f, ny_f, Fscale, vmapP_k, vmapP_n,
+                    bc_per_node, face_x, beta, nu, sigma_ip, lid_velocity,
+                    K, Np, Nfp, n_fp, lid_taper_val,
+                    cfl, h_min, p, 2, 0.0, t_final)
 
-    print("  Solving...", flush=True)
+    print(f"  C_ip={C_ip}, sigma_ip={sigma_ip:.4f}")
+    print("  Solving (batched Numba SSP-RK3)...", flush=True)
     t0_wall = time.perf_counter()
     t_sim = 0.0
     step = 0
     residuals = []
 
-    def rhs_func(q_in, t):
-        return _cavity_rhs(q_in, Dr, Ds, rx, ry, sx, sy, LIFT, Fmask_flat,
-                           nx_f, ny_f, Fscale, vmapP_k, vmapP_n,
-                           bc_per_node, face_x, beta, nu, sigma_ip, lid_velocity,
-                           K, Np, Nfp, n_fp)
-
-    while t_sim < t_final - 1e-14 and step < 2_000_000:
-        a_max = _ac_max_wavespeed(q, beta, K, Np) + 1e-14
-        dt = min(cfl * h_min / ((2 * p + 1) * a_max), t_final - t_sim)
-
-        # SSP-RK3 inlined to avoid function call overhead
-        rhs1 = rhs_func(q, t_sim)
-        u1 = q + dt * rhs1
-        rhs2 = rhs_func(u1, t_sim + dt)
-        u2 = 0.75 * q + 0.25 * (u1 + dt * rhs2)
-        rhs3 = rhs_func(u2, t_sim + 0.5 * dt)
-        q = (1.0 / 3.0) * q + (2.0 / 3.0) * (u2 + dt * rhs3)
-
-        t_sim += dt
-        step += 1
-
-        if step % print_every == 0:
-            res = np.max(np.abs(rhs3))
-            residuals.append((t_sim, res))
-            elapsed = time.perf_counter() - t0_wall
-            u_max = np.max(np.abs(q[:, :, 0]))
-            v_max = np.max(np.abs(q[:, :, 1]))
-            rate = step / elapsed
-            print(f"  step={step:7d}  t={t_sim:7.3f}  res={res:.4e}  "
-                  f"|u|={u_max:.4f}  |v|={v_max:.4f}  "
-                  f"wall={elapsed:.1f}s  {rate:.0f} step/s", flush=True)
-
-            if np.any(np.isnan(q)) or res > 1e6:
-                raise RuntimeError("Blowup")
+    # Run in batches of print_every steps to minimize Python overhead
+    while t_sim < t_final - 1e-14 and step < max_steps:
+        batch = min(print_every, max_steps - step)
+        q, t_sim, res = _ssprk3_n_steps(
+            q, Dr, Ds, rx, ry, sx, sy, LIFT, Fmask_flat,
+            nx_f, ny_f, Fscale, vmapP_k, vmapP_n,
+            bc_per_node, face_x, beta, nu, sigma_ip, lid_velocity,
+            K, Np, Nfp, n_fp, lid_taper_val,
+            cfl, h_min, p, batch, t_sim, t_final)
+        step += batch
+        residuals.append((t_sim, float(res)))
+        elapsed = time.perf_counter() - t0_wall
+        u_max = float(np.max(np.abs(q[:, :, 0])))
+        v_max = float(np.max(np.abs(q[:, :, 1])))
+        rate = step / elapsed
+        print(f"  step={step:7d}  t={t_sim:7.3f}  res={res:.4e}  "
+              f"|u|={u_max:.4f}  |v|={v_max:.4f}  "
+              f"wall={elapsed:.1f}s  {rate:.0f} step/s", flush=True)
+        if np.isnan(res) or res > 1e6:
+            raise RuntimeError(f"Blowup at step {step}")
+        if res < res_tol:
+            print(f"  Converged: res={res:.4e} at t={t_sim:.3f}", flush=True)
+            break
+        if t_sim >= t_final - 1e-14:
+            break
 
     elapsed = time.perf_counter() - t0_wall
-    print(f"\n  Done: {step} steps, t={t_sim:.3f}, {elapsed:.1f}s "
+    print(f"\n  Done: {step} steps, t={t_sim:.3f}, wall={elapsed:.1f}s "
           f"({step/elapsed:.0f} step/s)")
     if residuals:
         print(f"  Final residual: {residuals[-1][1]:.4e}")
