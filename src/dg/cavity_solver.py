@@ -8,11 +8,11 @@ For 288 elements P2: targets <100µs/step (vs 530µs with component approach).
 """
 
 import numpy as np
-from numba import njit, prange
+from numba import njit
 import time
 
 
-@njit(cache=True, parallel=True)
+@njit(cache=True)
 def _ac_max_wavespeed(q, beta, K, Np):
     """Global max wavespeed for CFL."""
     b2 = beta * beta
@@ -28,7 +28,7 @@ def _ac_max_wavespeed(q, beta, K, Np):
     return wmax
 
 
-@njit(cache=True, parallel=True)
+@njit(cache=True)
 def _ssprk3_n_steps(q, Dr, Ds, rx, ry, sx, sy, LIFT, Fmask_flat,
                     nx_f, ny_f, Fscale, vmapP_k, vmapP_n,
                     bc_per_node, face_x, beta, nu, sigma_ip, lid_vel,
@@ -79,7 +79,7 @@ def _ssprk3_n_steps(q, Dr, Ds, rx, ry, sx, sy, LIFT, Fmask_flat,
     return q, t_sim, res
 
 
-@njit(cache=True, parallel=True)
+@njit(cache=True)
 def _cavity_rhs(q, Dr, Ds, rx, ry, sx, sy, LIFT, Fmask_flat,
                 nx_f, ny_f, Fscale, vmapP_k, vmapP_n,
                 bc_per_node, face_x, beta, nu, sigma_ip, lid_vel,
@@ -97,7 +97,7 @@ def _cavity_rhs(q, Dr, Ds, rx, ry, sx, sy, LIFT, Fmask_flat,
     rhs = np.empty((K, Np, 3), dtype=np.float64)
     b2 = beta * beta
 
-    for k in prange(K):
+    for k in range(K):
         rx_k = rx[k, 0]
         ry_k = ry[k, 0]
         sx_k = sx[k, 0]
